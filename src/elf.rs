@@ -21,6 +21,7 @@ pub struct ElfLoadedMeta {
     pub phnum: u64,
     pub phent: u64,
     pub image_end: u64,
+    pub rw_min: u64,
 }
 
 const AT_NULL: u64 = 0;
@@ -30,19 +31,19 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_ENTRY: u64 = 9;
 
-/// Same as [`load_elf`] but also returns **PHDR** metadata for **auxv**.
 pub fn load_elf(image: &[u8], bias: u64) -> Result<u64, &'static str> {
     let (e, meta) = load_elf_mapped(image, bias)?;
-    finish_user_meta(&meta);
+    apply_user_meta(&meta);
     Ok(e)
 }
 
-fn finish_user_meta(meta: &ElfLoadedMeta) {
+fn apply_user_meta(meta: &ElfLoadedMeta) {
     crate::user::set_user_image_end(
         meta
             .image_end
             .max(crate::user::USER_TEXT_BASE + Size4KiB::SIZE),
     );
+    crate::user::set_user_rw_image_start(meta.rw_min);
 }
 
 pub fn load_elf_exec(
@@ -52,33 +53,9 @@ pub fn load_elf_exec(
 ) -> Result<(u64, u64), &'static str> {
     unmap_old_image_best_effort();
     let (entry, meta) = load_elf_mapped(image, bias)?;
-    finish_user_meta(&meta);
-    let rw = meta.image_end.max(crate::user::USER_TEXT_BASE + Size4KiB::SIZE);
-    let rw_lo = rw_min_for_load(image, bias).unwrap_or(crate::user::USER_TEXT_BASE + Size4KiB::SIZE);
-    crate::user::set_user_rw_image_start(rw_lo);
+    apply_user_meta(&meta);
     let rsp = build_exec_stack(&meta, &args)?;
     Ok((entry, rsp))
-}
-
-fn rw_min_for_load(image: &[u8], bias: u64) -> Option<u64> {
-    let e_phoff = u64::from_le_bytes(image[32..40].try_into().ok()?);
-    let e_phnum = u16::from_le_bytes(image[56..58].try_into().ok()?) as usize;
-    let e_phentsize = u16::from_le_bytes(image[54..56].try_into().ok()?) as usize;
-    let mut rw_min: Option<u64> = None;
-    for i in 0..e_phnum {
-        let off = e_phoff as usize + i * e_phentsize;
-        let hdr = image.get(off..off + 56)?;
-        if u32::from_le_bytes(hdr[0..4].try_into().ok()?) != 1 {
-            continue;
-        }
-        let p_flags = u32::from_le_bytes(hdr[4..8].try_into().ok()?);
-        let p_vaddr = u64::from_le_bytes(hdr[16..24].try_into().ok()?);
-        if p_flags & 2 != 0 {
-            let seg = p_vaddr.wrapping_add(bias);
-            rw_min = Some(rw_min.map_or(seg, |m: u64| m.min(seg)));
-        }
-    }
-    rw_min
 }
 
 fn unmap_old_image_best_effort() {
@@ -103,11 +80,8 @@ fn load_elf_mapped(image: &[u8], bias: u64) -> Result<(u64, ElfLoadedMeta), &'st
     if image.len() < 64 {
         return Err("truncated");
     }
-    if &image[0..4] != ELFMAG {
-        return Err("bad magic");
-    }
-    if image[4] != 2 || image[5] != 1 {
-        return Err("not le64");
+    if &image[0..4] != ELFMAG || image[4] != 2 || image[5] != 1 {
+        return Err("bad elf");
     }
     let e_type = u16::from_le_bytes(image[16..18].try_into().unwrap());
     if e_type != 2 && e_type != 3 {
@@ -166,7 +140,7 @@ fn load_elf_mapped(image: &[u8], bias: u64) -> Result<(u64, ElfLoadedMeta), &'st
             let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
             if p_flags & 2 != 0 {
                 flags |= PageTableFlags::WRITABLE;
-                rw_min = Some(rw_min.map_or(seg, |m: u64| m.min(seg)));
+                rw_min = Some(rw_min.map_or(seg, |m| m.min(seg)));
             }
             if p_flags & 1 != 0 {
             } else {
@@ -199,7 +173,7 @@ fn load_elf_mapped(image: &[u8], bias: u64) -> Result<(u64, ElfLoadedMeta), &'st
                 let phys = mapper
                     .translate_addr(VirtAddr::new(va))
                     .ok_or("translate")?;
-                let kw = VirtAddr::new(crate::memory::hex_to_virt(phys));
+                let kw = VirtAddr::new(crate::memory::phys_to_virt(phys));
                 unsafe {
                     *kw.as_mut_ptr::<u8>() = image[file_off];
                 }
@@ -211,9 +185,7 @@ fn load_elf_mapped(image: &[u8], bias: u64) -> Result<(u64, ElfLoadedMeta), &'st
     })?;
 
     let phdr = phdr_va.ok_or("no phdr in LOAD")?;
-    crate::user::set_user_rw_image_start(rw_min.unwrap_or(
-        crate::user::USER_TEXT_BASE + Size4KiB::SIZE,
-    ));
+    let rw = rw_min.unwrap_or(crate::user::USER_TEXT_BASE + Size4KiB::SIZE);
 
     Ok((
         e_entry.wrapping_add(bias),
@@ -223,11 +195,11 @@ fn load_elf_mapped(image: &[u8], bias: u64) -> Result<(u64, ElfLoadedMeta), &'st
             phnum: e_phnum as u64,
             phent: e_phentsize as u64,
             image_end,
+            rw_min: rw,
         },
     ))
 }
 
-// typo fix - phys_to_virt not hex_to_virt
 fn write_user_byte(va: u64, b: u8) -> Result<(), &'static str> {
     let phys = crate::paging::with_mapper(|m| m.translate_addr(VirtAddr::new(va)))
         .ok_or("no map")?;
@@ -238,129 +210,83 @@ fn write_user_byte(va: u64, b: u8) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn write_user_slice(va: u64, data: &[u8]) -> Result<(), &'static str> {
-    for (i, &b) in data.iter().enumerate() {
-        write_user_byte(va + i as u64, b)?;
-    }
-    Ok(())
-}
-
-fn write_u64(va: u64, v: u64) -> Result<(), &'static str> {
-    for i in 0..8 {
-        write_user_byte(va + i, ((v >> (8 * i)) & 0xFF) as u8)?;
-    }
-    Ok(())
-}
-
-fn align_up(mut x: usize, a: usize) -> usize {
-    if x == 0 {
-        return 0;
-    }
+fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) & !(a - 1)
 }
 
+/// SysV amd64 **initial stack**: **`argc`**, `argv[]`, `0`, `envp[]`, `0`, `auxv`, then strings (ascending VA).
 fn build_exec_stack(meta: &ElfLoadedMeta, args: &ExecArgs<'_>) -> Result<u64, &'static str> {
     let stack_lo = crate::user::USER_STACK_TOP - Size4KiB::SIZE;
-    let mut layout: Vec<u8> = Vec::new();
-    let mut strings: Vec<(usize, u64)> = Vec::new();
-
+    let aux_pairs = 6usize;
+    let mut v: Vec<u8> = Vec::new();
+    v.extend_from_slice(&(args.argv.len() as u64).to_le_bytes());
+    let argv_tab = v.len();
+    for _ in 0..args.argv.len() {
+        v.extend_from_slice(&0u64.to_le_bytes());
+    }
+    v.extend_from_slice(&0u64.to_le_bytes());
+    let env_tab = v.len();
+    for _ in 0..args.envp.len() {
+        v.extend_from_slice(&0u64.to_le_bytes());
+    }
+    v.extend_from_slice(&0u64.to_le_bytes());
+    for _ in 0..aux_pairs {
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+    }
+    while v.len() % 16 != 0 {
+        v.push(0);
+    }
+    let str0 = align_up(v.len() as u64, 16) as usize;
+    while v.len() < str0 {
+        v.push(0);
+    }
+    let mut str_off: Vec<u64> = Vec::new();
     for e in args.envp {
-        let off = layout.len();
-        layout.extend_from_slice(e.as_bytes());
-        layout.push(0);
-        while layout.len() % 8 != 0 {
-            layout.push(0);
+        str_off.push(stack_lo + v.len() as u64);
+        v.extend_from_slice(e.as_bytes());
+        v.push(0);
+        while v.len() % 8 != 0 {
+            v.push(0);
         }
-        strings.push((off, 0));
     }
     for a in args.argv {
-        let off = layout.len();
-        layout.extend_from_slice(a.as_bytes());
-        layout.push(0);
-        while layout.len() % 8 != 0 {
-            layout.push(0);
+        str_off.push(stack_lo + v.len() as u64);
+        v.extend_from_slice(a.as_bytes());
+        v.push(0);
+        while v.len() % 8 != 0 {
+            v.push(0);
         }
-        strings.push((off, 0));
     }
-
-    let string_base = align_up(layout.len(), 16);
-    let aux_bytes = 8 * 2 * 7;
-    let argv_n = args.argv.len();
+    if stack_lo + v.len() as u64 > crate::user::USER_STACK_TOP {
+        return Err("stack ovf");
+    }
     let env_n = args.envp.len();
-    let ptr_area = 8 + (argv_n + 1) * 8 + (env_n + 1) * 8 + aux_bytes + 16;
-    let total = string_base + ptr_area;
-    if total > Size4KiB::SIZE as usize {
-        return Err("stack ovf");
+    for i in 0..env_n {
+        let o = env_tab + i * 8;
+        v[o..o + 8].copy_from_slice(&str_off[i].to_le_bytes());
     }
-
-    layout.resize(string_base, 0);
-    let blob_start = stack_lo + (Size4KiB::SIZE - total) as u64;
-    if blob_start < stack_lo {
-        return Err("stack ovf");
-    }
-
-    let mut write_off = 0usize;
-    for (i, e) in args.envp.iter().enumerate() {
-        strings[i].1 = blob_start + write_off as u64;
-        write_off = align_up(write_off + e.len() + 1, 8);
-    }
-    let env_base_i = args.envp.len();
-    for (j, a) in args.argv.iter().enumerate() {
-        strings[env_base_i + j].1 = blob_start + write_off as u64;
-        write_off = align_up(write_off + a.len() + 1, 8);
-    }
-
-    write_off = 0;
-    for (e, _) in args.envp.iter().zip(0..) {
-        write_user_slice(blob_start + write_off as u64, e.as_bytes())?;
-        write_off += e.len();
-        write_user_byte(blob_start + write_off as u64, 0)?;
-        write_off += 1;
-        write_off = align_up(write_off, 8);
-    }
-    for a in args.argv {
-        write_user_slice(blob_start + write_off as u64, a.as_bytes())?;
-        write_off += a.len();
-        write_user_byte(blob_start + write_off as u64, 0)?;
-        write_off += 1;
-        write_off = align_up(write_off, 8);
-    }
-
-    let mut sp = crate::user::USER_STACK_TOP as i64;
-    sp -= 8;
-    write_u64(sp as u64, args.argv.len() as u64)?;
     for i in 0..args.argv.len() {
-        sp -= 8;
-        write_u64(sp as u64, strings[env_base_i + i].1)?;
+        let o = argv_tab + i * 8;
+        v[o..o + 8].copy_from_slice(&str_off[env_n + i].to_le_bytes());
     }
-    sp -= 8;
-    write_u64(sp as u64, 0)?;
-    for i in 0..args.envp.len() {
-        sp -= 8;
-        write_u64(sp as u64, strings[i].1)?;
-    }
-    sp -= 8;
-    write_u64(sp as u64, 0)?;
-
     let aux: &[(u64, u64)] = &[
-        (0, AT_NULL),
-        (meta.phent, AT_PHENT),
-        (meta.phnum, AT_PHNUM),
-        (Size4KiB::SIZE, AT_PAGESZ),
-        (meta.phdr, AT_PHDR),
-        (meta.entry, AT_ENTRY),
+        (AT_PHDR, meta.phdr),
+        (AT_PHENT, meta.phent),
+        (AT_PHNUM, meta.phnum),
+        (AT_PAGESZ, Size4KiB::SIZE),
+        (AT_ENTRY, meta.entry),
+        (AT_NULL, 0),
     ];
-    for &(val, tag) in aux.iter().rev() {
-        sp -= 8;
-        write_u64(sp as u64, val)?;
-        sp -= 8;
-        write_u64(sp as u64, tag)?;
+    let mut ao = env_tab + (env_n + 1) * 8;
+    for &(tag, val) in aux {
+        let slot = v.get_mut(ao..ao + 16).ok_or("aux ovf")?;
+        slot[..8].copy_from_slice(&tag.to_le_bytes());
+        slot[8..].copy_from_slice(&val.to_le_bytes());
+        ao += 16;
     }
-
-    while sp % 16 != 0 {
-        sp -= 8;
-        write_u64(sp as u64, 0)?;
+    for (i, &b) in v.iter().enumerate() {
+        write_user_byte(stack_lo + i as u64, b)?;
     }
-
-    Ok(sp as u64)
+    Ok(stack_lo)
 }

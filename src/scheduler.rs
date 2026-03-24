@@ -75,11 +75,6 @@ pub fn schedule_after_exit() -> ! {
     pick_next_and_restore();
 }
 
-/// Wait for IRQs (and other tasks) while [`crate::process::wait_reap`] has nothing to return.
-pub fn block_current_on_wait() {
-    x86_64::instructions::interrupts::enable_and_hlt();
-}
-
 /// Busy-sleep using the PIT tick counter until `deadline` (inclusive).
 pub fn sleep_until_ticks(deadline: u64) {
     while crate::interrupts::ticks() < deadline {

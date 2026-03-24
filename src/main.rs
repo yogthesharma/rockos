@@ -108,11 +108,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     println!(
-        "Syscalls: read=0 (TTY lines), write=1, brk=12, mmap=9, yield=24, nanosleep=35, wait4=61, exit=60.",
+        "Syscalls: open/close 2/3, read/write 0/1, mmap/munmap 9/11, brk 12, fork 57, execve 59, yield 24, wait4 61 (EAGAIN loop), getpid/ppid 39/110, exit 60.",
     );
     syscall::init();
-    process::init();
-    scheduler::init(process::current_pid());
 
     user::map_user_stack();
     const INIT_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/init.elf"));
@@ -129,6 +127,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             user::set_user_entry(user::USER_TEXT_BASE);
         }
     }
+
+    process::init();
+    scheduler::init(process::current_pid());
 
     println!(
         "Ring 3 entry RIP={:#x} stack {:#x} (IF=1: IRQ timer + keyboard)",

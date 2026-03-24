@@ -6,7 +6,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-const LINE_BUF: usize = 256;
+const LINE_BUF: usize = 1024;
+const MAX_READY_LINES: usize = 128;
 
 static TTY: Mutex<TtyState> = Mutex::new(TtyState::new());
 
@@ -78,7 +79,7 @@ impl TtyState {
             '\n' | '\r' => {
                 let mut line = core::mem::take(&mut self.line_edit);
                 line.push(b'\n');
-                if self.ready_lines.len() < 32 {
+                if self.ready_lines.len() < MAX_READY_LINES {
                     self.ready_lines.push_back(line);
                 }
             }
@@ -127,16 +128,16 @@ pub fn feed_from_irq(scancode: u8) {
     TTY.lock().feed_scancode(scancode);
 }
 
-/// Non-blocking read of the next **complete line** (including trailing `\n`).
-pub fn read_line(dst: &mut [u8]) -> usize {
+/// Line discipline: **blocking** (until a line exists) vs **non-blocking** (`EAGAIN` = `-11`).
+pub fn read(dst: &mut [u8], nonblock: bool) -> Result<usize, i32> {
     let mut g = TTY.lock();
     let Some(line) = g.ready_lines.pop_front() else {
-        return 0;
+        return if nonblock { Err(-11) } else { Ok(0) };
     };
     let n = line.len().min(dst.len());
     dst[..n].copy_from_slice(&line[..n]);
     if n < line.len() {
         g.ready_lines.push_front(line[n..].to_vec());
     }
-    n
+    Ok(n)
 }

@@ -2,11 +2,16 @@
 name = "rockos"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [[bin]]
 name = "rockos"
 test = false
 bench = false
+
+[workspace]
+members = ["userspace/init"]
+resolver = "2"
 
 [dependencies]
 # 0.11 is not usable as a kernel dep on x86_64-unknown-none; bootimage 0.10 targets the 0.9 API.

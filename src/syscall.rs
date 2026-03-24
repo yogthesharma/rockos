@@ -4,7 +4,6 @@ use core::arch::global_asm;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
-use x86_64::instructions::interrupts;
 
 #[no_mangle]
 pub static mut SYSCALL_USER_RSP_STASH: u64 = 0;
@@ -121,20 +120,18 @@ fn exit_and_schedule(code: i32) -> ! {
 }
 
 fn sys_wait4(pid: i64, wstatus: u64) -> u64 {
-    loop {
-        if let Some((child, st)) = crate::process::wait_reap(pid) {
-            if wstatus != 0 {
-                if !crate::user::user_region_is_writable_range(wstatus, 4) {
-                    return (-14i64) as u64;
-                }
-                unsafe {
-                    (wstatus as *mut i32).write(st);
-                }
+    if let Some((child, st)) = crate::process::wait_reap(pid) {
+        if wstatus != 0 {
+            if !crate::user::user_region_is_writable_range(wstatus, 4) {
+                return (-14i64) as u64;
             }
-            return child;
+            unsafe {
+                (wstatus as *mut i32).write(st);
+            }
         }
-        crate::scheduler::block_current_on_wait();
+        return child;
     }
+    (-11i64) as u64
 }
 
 fn sys_nanosleep(req: u64) -> u64 {

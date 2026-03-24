@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -69,7 +70,8 @@ static TABLE: Mutex<Option<ProcessTable>> = Mutex::new(None);
 static CURRENT_SLOT: Mutex<usize> = Mutex::new(0);
 
 struct ProcessTable {
-    procs: Vec<Option<Process>>,
+    /// Box avoids a multi‑megabyte `Vec` of `Option<Process>` (each `Process` embeds a 4 KiB kstack).
+    procs: Vec<Option<Box<Process>>>,
 }
 
 impl ProcessTable {
@@ -96,7 +98,7 @@ pub fn init() {
     v.resize_with(32, || None);
     let init_p = Process::new(1, None, bootstrap);
     let top = init_p.kstack_top();
-    v[0] = Some(init_p);
+    v[0] = Some(Box::new(init_p));
     *TABLE.lock() = Some(ProcessTable { procs: v });
     *CURRENT_SLOT.lock() = 0;
     crate::task::set_current_kstack_top(top);
@@ -109,7 +111,7 @@ pub fn current_slot() -> usize {
 pub fn set_current_slot(s: usize) {
     *CURRENT_SLOT.lock() = s;
     if let Some(t) = TABLE.lock().as_ref() {
-        if let Some(p) = t.procs.get(s).and_then(|x| x.as_ref()) {
+        if let Some(p) = t.procs.get(s).and_then(|x| x.as_deref()) {
             crate::task::set_current_kstack_top(p.kstack_top());
         }
     }
@@ -144,7 +146,7 @@ pub fn kstack_top_for_slot(slot: usize) -> u64 {
         .lock()
         .as_ref()
         .and_then(|t| t.procs.get(slot))
-        .and_then(|p| p.as_ref())
+        .and_then(|p| p.as_deref())
         .map(|p| p.kstack_top())
         .unwrap_or_else(|| crate::task::current_kstack_top())
 }
@@ -154,7 +156,7 @@ pub fn syscall_saved_for_slot(slot: usize) -> SyscallSaved {
         .lock()
         .as_ref()
         .and_then(|t| t.procs.get(slot))
-        .and_then(|p| p.as_ref())
+        .and_then(|p| p.as_deref())
         .map(|p| p.save.clone())
         .expect("saved")
 }
@@ -173,7 +175,7 @@ pub fn pending_rax_for_slot(slot: usize) -> u64 {
         .lock()
         .as_ref()
         .and_then(|t| t.procs.get(slot))
-        .and_then(|p| p.as_ref())
+        .and_then(|p| p.as_deref())
         .map(|p| p.pending_rax)
         .unwrap_or(0)
 }
@@ -183,7 +185,7 @@ pub fn slot_is_alive_runnable(slot: usize) -> bool {
         .lock()
         .as_ref()
         .and_then(|t| t.procs.get(slot))
-        .and_then(|p| p.as_ref())
+        .and_then(|p| p.as_deref())
         .map(|p| p.exit_code.is_none())
         .unwrap_or(false)
 }
@@ -280,23 +282,30 @@ pub fn sys_brk(addr: u64) -> u64 {
 }
 
 fn map_brk_shrink(new_end: u64, old_end: u64) -> Result<(), ()> {
-    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(new_end));
-    let last_excl = Page::<Size4KiB>::containing_address(VirtAddr::new(old_end.saturating_sub(1)));
-    if new_end == old_end {
+    if new_end >= old_end || new_end < USER_BRK_BASE {
         return Ok(());
     }
+    let first_page_lo = align_up(new_end, Size4KiB::SIZE);
+    if first_page_lo >= old_end {
+        return Ok(());
+    }
+    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(first_page_lo));
+    let last = Page::<Size4KiB>::containing_address(VirtAddr::new(old_end.saturating_sub(1)));
     crate::paging::with_mapper(|mapper| {
         let mut guard = crate::memory::lock_allocator();
         let fa = guard.as_mut().ok_or(())?;
-        for page in Page::range_inclusive(first, last_excl) {
-            let va = page.start_address();
-            if va.as_u64() < new_end {
+        for page in Page::range_inclusive(first, last) {
+            if mapper.translate_addr(page.start_address()).is_none() {
                 continue;
             }
-            crate::paging::unmap_4k_and_free_bitmap(mapper, fa, va).map_err(|_| ())?;
+            let _ = crate::paging::unmap_4k_and_free_bitmap(mapper, fa, page.start_address());
         }
         Ok::<(), ()>(())
     })
+}
+
+fn align_up(x: u64, a: u64) -> u64 {
+    (x + a - 1) & !(a - 1)
 }
 
 fn map_brk_grow(old_end: u64, new_end: u64, flags: PageTableFlags) -> Result<(), ()> {
@@ -452,12 +461,28 @@ pub fn sys_fork() -> u64 {
     let delta = crate::user::USER_STACK_TOP.saturating_sub(saved.user_rsp);
     child_save.user_rsp = USER_STACK_CHILD_TOP.saturating_sub(delta);
 
-    let child = Process::new(child_pid, Some(parent_pid), child_save.clone());
+    let (vm, brk) = {
+        let g = TABLE.lock();
+        let t = g.as_ref().unwrap();
+        let p = t.procs[parent_slot].as_deref().unwrap();
+        (p.vm_areas.clone(), p.brk_end)
+    };
+
+    let child = Process {
+        pid: child_pid,
+        parent: Some(parent_pid),
+        brk_end: brk,
+        vm_areas: vm,
+        exit_code: None,
+        kstack: AlignedKstack([0u8; 4096]),
+        save: child_save.clone(),
+        pending_rax: 0,
+    };
     let child_slot = {
         let mut g = TABLE.lock();
         let t = g.as_mut().unwrap();
         let slot = t.alloc_slot().unwrap();
-        t.procs[slot] = Some(child);
+        t.procs[slot] = Some(Box::new(child));
         slot
     };
 
@@ -478,12 +503,14 @@ fn map_child_stack_and_copy(saved: &SyscallSaved) -> Result<(), ()> {
         let mut guard = crate::memory::lock_allocator();
         let fa = guard.as_mut().ok_or(())?;
         let page = Page::containing_address(VirtAddr::new(CHILD_STACK_LO));
-        let frame: PhysFrame<Size4KiB> = fa.allocate_frame().ok_or(())?;
-        unsafe {
-            mapper
-                .map_to(page, frame, fl, fa)
-                .map_err(|_| ())?
-                .flush();
+        if mapper.translate_addr(page.start_address()).is_none() {
+            let frame: PhysFrame<Size4KiB> = fa.allocate_frame().ok_or(())?;
+            unsafe {
+                mapper
+                    .map_to(page, frame, fl, fa)
+                    .map_err(|_| ())?
+                    .flush();
+            }
         }
         Ok::<(), ()>(())
     })?;
@@ -518,7 +545,7 @@ fn copy_user_pages(src: u64, dst: u64, len: usize) -> Result<(), ()> {
 pub fn alloc_pid() -> Option<u64> {
     with_table_mut(|t| {
         for cand in 2..1024u64 {
-            if t.procs.iter().flatten().all(|p| p.pid != cand) {
+            if t.procs.iter().filter_map(|x| x.as_deref()).all(|p| p.pid != cand) {
                 return Some(cand);
             }
         }
