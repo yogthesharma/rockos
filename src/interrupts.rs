@@ -162,7 +162,8 @@ extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error: u64) {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::scheduler::on_timer_tick(t);
     unsafe {
         Port::<u8>::new(PIC1_CMD).write(0x20);
     }

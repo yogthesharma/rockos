@@ -25,14 +25,18 @@ panic = "abort"
 [package.metadata.bootimage]
 # Keep in sync with Makefile.toml [tasks.qemu]. args
 # -no-reboot: triple fault exits QEMU instead of rebooting into a confusing loop.
-# -d …: log interrupts / guest errors / CPU reset to stderr (see why the guest resets).
-# More: run `qemu-system-x86_64 -trace help` and add e.g. `-trace events=…` for event traces.
+# -D + -d: send QEMU debug (-d) to `target/qemu-debug.log` so `-serial stdio` (stdout) is not
+#   interleaved with `cpu_reset` / SMM dumps (no more `EFER=…Hello` on one line).
+# Less boot noise: change `-d` to `int,guest_errors` (drop `cpu_reset`) while not chasing triple faults.
 run-args = [
     "-serial", "stdio",
     "-vga", "std",
     "-no-reboot",
-    "-d", "int,guest_errors,cpu_reset",
+    "-D",
+    "target/qemu-debug.log",
+    "-d",
+    "int,guest_errors,cpu_reset",
 ]
 
 [package.metadata.cargo-make]
-run = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin -serial stdio -vga std -no-reboot -d int,guest_errors,cpu_reset"
+run = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin -serial stdio -vga std -no-reboot -D target/qemu-debug.log -d int,guest_errors,cpu_reset"

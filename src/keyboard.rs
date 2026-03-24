@@ -90,6 +90,7 @@ pub fn handle_keyboard_irq() {
         }
         let mut q = SCANCODE_QUEUE.lock();
         let _ = q.try_push(b);
+        crate::tty::feed_from_irq(b);
     }
 }
 

@@ -13,6 +13,7 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use x86_64::instructions::hlt;
 
+mod elf;
 mod gdt;
 mod heap;
 mod interrupts;
@@ -20,8 +21,11 @@ mod keyboard;
 mod memory;
 mod paging;
 mod pit;
+mod process;
+mod scheduler;
 mod serial;
 mod syscall;
+mod tty;
 mod user;
 mod vga;
 
@@ -86,11 +90,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         interrupts::ticks()
     );
 
+    let warm_ticks = pit::TIMER_HZ as u64 * 2;
     println!(
-        "~{} tick keyboard window, then Unix-ish ring 3 (`write`=1) demo.",
-        pit::TIMER_HZ as u64 * 5
+        "~{warm_ticks} tick keyboard window (cooked TTY feed), then ring 3 (IF=1).",
     );
-    let keyboard_until = interrupts::ticks() + pit::TIMER_HZ as u64 * 5;
+    let keyboard_until = interrupts::ticks() + warm_ticks;
     while interrupts::ticks() < keyboard_until {
         while let Some(scancode) = keyboard::read_scancode() {
             match keyboard::scancode_to_char(scancode) {
@@ -102,18 +106,35 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     println!(
-        "Syscalls: read=0 (scancodes, non-blocking), write=1, mmap/brk stub ENOSYS, exit=60.",
+        "Syscalls: read=0 (TTY lines), write=1, brk=12, mmap=9, yield=24, nanosleep=35, wait4=61, exit=60.",
     );
-    println!("Ring 3 enters with IF=0 (no IRQ in user) — use user::enter_via_iret_irqs_on() to test timer.");
     syscall::init();
-    user::map_and_load();
+    process::init();
+    scheduler::init(process::current_pid());
+
+    user::map_user_stack();
+    const INIT_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/init.elf"));
+    match elf::load_elf(INIT_ELF, 0) {
+        Ok(entry) => {
+            user::set_user_entry(entry);
+            println!("Loaded init ELF, entry {:#x}", entry);
+        }
+        Err(e) => {
+            println!("ELF load {e} — built-in blob");
+            user::map_user_blob();
+            user::set_user_image_end(user::USER_TEXT_BASE + 4096);
+            user::set_user_rw_image_start(user::USER_TEXT_BASE + 4096);
+            user::set_user_entry(user::USER_TEXT_BASE);
+        }
+    }
+
     println!(
-        "User @ text {:#x} stack {:#x}; expect serial line from user `write`:",
-        user::USER_TEXT_BASE,
+        "Ring 3 entry RIP={:#x} stack {:#x} (IF=1: IRQ timer + keyboard)",
+        user::USER_ENTRY_RIP.load(core::sync::atomic::Ordering::Relaxed),
         user::USER_STACK_TOP
     );
     unsafe {
-        user::enter_via_iret();
+        user::enter_via_iret_irqs_on();
     }
 }
 

@@ -1,27 +1,13 @@
-//! `syscall` / `sysret` ABI (Linux-compatible numbers for [`crate::user`] demos).
-//!
-//! # Implemented
-//! - [`SYS_READ`] (**0**): non-blocking read of **raw PS/2 scancodes** from `fd == 0` into user memory.
-//! - [`SYS_WRITE`] (**1**): `fd` ignored; writes to serial.
-//! - [`SYS_EXIT`] (**60**): log and return `0` to ring 3.
-//!
-//! # Stubs (`-ENOSYS`)
-//! - [`SYS_MMAP`] (**9**), [`SYS_BRK`] (**12**): not yet (need virtual-memory policy + per-process state).
-//!
-//! # Roadmap (Unix-ish)
-//! - **`mmap` / `brk`**: anonymous mappings, optional kernel `VmArea` list, syscall return virt ranges.
-//! - **Per-process address space**: separate P4 or deep `fork`; switch `CR3` on reschedule.
-//! - **ELF loader / `exec`**: parse program headers, map RX/RW, user stack, `auxv`, jump to entry.
-//! - **Scheduler + `sleep`**: wait queues, `nanosleep`-style syscall, tie PIT or TSC to ticks.
-//! - **`wait` / `exit`**: parent collects status; zombie/reap; align with `SIGCHLD`-like semantics later.
+//! Linux-compatible `syscall` / `sysret` ABI with **per-task kernel stacks** and scheduling tail.
 
 use core::arch::global_asm;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
+use x86_64::instructions::interrupts;
 
 #[no_mangle]
-static mut SYSCALL_USER_RSP_STASH: u64 = 0;
+pub static mut SYSCALL_USER_RSP_STASH: u64 = 0;
 
 #[repr(C, align(4096))]
 struct SyscallKernelStack([u8; 4096]);
@@ -32,10 +18,11 @@ static mut SYSCALL_KERNEL_STACK: SyscallKernelStack = SyscallKernelStack([0u8; 4
 global_asm!(
     ".section .text",
     ".global syscall_entry",
-    ".type syscall_entry, @function",
+    ".global syscall_user_return",
     "syscall_entry:",
     "mov [rip + SYSCALL_USER_RSP_STASH], rsp",
-    "lea rsp, [rip + SYSCALL_KERNEL_STACK + 4096]",
+    "mov r14, [rip + CURRENT_KSTACK_TOP]",
+    "lea rsp, [r14]",
     "push [rip + SYSCALL_USER_RSP_STASH]",
     "push rcx",
     "push r11",
@@ -55,6 +42,10 @@ global_asm!(
     "mov rdx, r10",
     "mov rcx, r11",
     "call syscall_dispatch",
+    "mov rdi, rax",
+    "mov rsi, rsp",
+    "call syscall_tail",
+    "syscall_user_return:",
     "add rsp, 8",
     "pop r15",
     "pop r14",
@@ -70,63 +61,107 @@ global_asm!(
 
 unsafe extern "C" {
     fn syscall_entry();
+    pub fn syscall_user_return();
 }
 
 const ENOSYS: u64 = (-38i64) as u64;
 
-/// Linux x86-64: `read(2)`
 pub const SYS_READ: u64 = 0;
-/// Linux: `write(2)`
 pub const SYS_WRITE: u64 = 1;
-/// Linux: `mmap(2)` — stub
-pub const SYS_MMAP: u64 = 9;
-/// Linux: `brk(2)` — stub
+pub const SYS_OPEN: u64 = 2;
+pub const SYS_CLOSE: u64 = 3;
+pub const SYS_SCHED_YIELD: u64 = 24;
+pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_BRK: u64 = 12;
-/// Linux: `exit(2)` / `exit_group`-style status in `rdi`.
+pub const SYS_MMAP: u64 = 9;
+pub const SYS_MUNMAP: u64 = 11;
+pub const SYS_FORK: u64 = 57;
+pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_WAIT4: u64 = 61;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_GETPPID: u64 = 110;
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_ANONYMOUS: u64 = 0x20;
 
 #[no_mangle]
 extern "C" fn syscall_dispatch(n: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     match n {
         SYS_READ => sys_read(arg0, arg1, arg2),
         SYS_WRITE => sys_write(arg0, arg1, arg2),
-        SYS_MMAP | SYS_BRK => ENOSYS,
-        SYS_EXIT => {
-            crate::println!("[syscall] exit({})", arg0 as i32);
+        SYS_OPEN => crate::fs::sys_open(arg0, arg1),
+        SYS_CLOSE => crate::fs::sys_close(arg0),
+        SYS_BRK => crate::process::sys_brk(arg0),
+        SYS_MMAP => crate::process::sys_mmap(arg0, arg1, arg2, MAP_PRIVATE | MAP_ANONYMOUS),
+        SYS_MUNMAP => crate::process::sys_munmap(arg0, arg1),
+        SYS_FORK => crate::process::sys_fork(),
+        SYS_EXECVE => crate::process::sys_execve(arg0, arg1, arg2),
+        SYS_SCHED_YIELD => {
+            crate::scheduler::note_yield();
             0
         }
+        SYS_NANOSLEEP => sys_nanosleep(arg0),
+        SYS_WAIT4 => sys_wait4(arg0 as i64, arg1),
+        SYS_GETPID => crate::process::current_pid(),
+        SYS_GETPPID => crate::process::current_ppid().unwrap_or(0),
+        SYS_EXIT => exit_and_schedule(arg0 as i32),
         _ => ENOSYS,
     }
 }
 
-/// `read(0, buf, len)` — drains the **IRQ keyboard queue** (raw scancodes). Non-blocking: returns
-/// `0`..=`len`, never waits for a key. Other `fd` → `-EBADF` (-9).
 fn sys_read(fd: u64, buf_addr: u64, len: u64) -> u64 {
-    if fd != 0 {
-        return (-9i64) as u64;
+    crate::fs::sys_read(fd, buf_addr, len)
+}
+
+fn exit_and_schedule(code: i32) -> ! {
+    crate::process::mark_exited(code);
+    crate::println!("[syscall] exit({})", code);
+    crate::scheduler::schedule_after_exit();
+}
+
+fn sys_wait4(pid: i64, wstatus: u64) -> u64 {
+    loop {
+        if let Some((child, st)) = crate::process::wait_reap(pid) {
+            if wstatus != 0 {
+                if !crate::user::user_region_is_writable_range(wstatus, 4) {
+                    return (-14i64) as u64;
+                }
+                unsafe {
+                    (wstatus as *mut i32).write(st);
+                }
+            }
+            return child;
+        }
+        crate::scheduler::block_current_on_wait();
     }
-    if len > 4096 {
-        return (-22i64) as u64;
-    }
-    let len = len as usize;
-    if !crate::user::user_region_is_writable_range(buf_addr, len) {
+}
+
+fn sys_nanosleep(req: u64) -> u64 {
+    if req == 0 {
         return (-14i64) as u64;
     }
-    let dst = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, len) };
-    let mut n = 0usize;
-    while n < len {
-        // `read_scancode`: IRQ queue first, then **port poll** — works even when user runs with `IF=0`.
-        let Some(b) = crate::keyboard::read_scancode() else {
-            break;
-        };
-        dst[n] = b;
-        n += 1;
+    if !crate::user::user_region_is_readable_range(req, 16) {
+        return (-14i64) as u64;
     }
-    n as u64
+    unsafe {
+        let sec = i64::from_le_bytes(core::slice::from_raw_parts(req as *const u8, 8).try_into().unwrap());
+        let nsec = i64::from_le_bytes(
+            core::slice::from_raw_parts((req + 8) as *const u8, 8)
+                .try_into()
+                .unwrap(),
+        );
+        let hz = crate::pit::TIMER_HZ as i64;
+        let mut ticks = sec.saturating_mul(hz);
+        ticks = ticks.saturating_add((nsec * hz) / 1_000_000_000);
+        let ticks = ticks.max(1) as u64;
+        crate::scheduler::sleep_until_ticks(crate::interrupts::ticks().saturating_add(ticks));
+    }
+    0
 }
 
 fn sys_write(_fd: u64, buf_addr: u64, len: u64) -> u64 {
-    if len > 4096 {
+    if len > 8192 {
         return (-28i64) as u64;
     }
     let len = len as usize;
@@ -134,8 +169,12 @@ fn sys_write(_fd: u64, buf_addr: u64, len: u64) -> u64 {
         return (-14i64) as u64;
     }
     let slice = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, len) };
-    crate::serial::write_bytes(slice);
-    len as u64
+    crate::fs::write_fd_any(_fd, slice)
+}
+
+#[no_mangle]
+extern "C" fn syscall_tail(ret_val: u64, dispatch_rsp: *const u64) -> ! {
+    crate::scheduler::complete_syscall_and_schedule(ret_val, dispatch_rsp);
 }
 
 pub fn init() {
