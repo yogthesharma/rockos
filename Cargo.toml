@@ -1,0 +1,29 @@
+[package]
+name = "rockos"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rockos"
+test = false
+bench = false
+
+[dependencies]
+# 0.11 is not usable as a kernel dep on x86_64-unknown-none; bootimage 0.10 targets the 0.9 API.
+bootloader = { version = "0.9.23", features = ["map_physical_memory"] }
+linked_list_allocator = "0.10"
+spin = "0.9"
+x86_64 = "0.14"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+# Used by `bootimage runner` when you `cargo run` — keep in sync with Makefile.toml.
+[package.metadata.bootimage]
+run-args = ["-serial", "stdio", "-vga", "std"]
+
+[package.metadata.cargo-make]
+run = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin -serial stdio -vga std"

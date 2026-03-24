@@ -1,0 +1,18 @@
+[env]
+CARGO_TERM_COLOR = "always"
+
+[tasks.bootimage]
+command = "cargo"
+args = ["bootimage"]
+
+[tasks.qemu]
+dependencies = ["bootimage"]
+command = "qemu-system-x86_64"
+args = [
+    "-drive", "format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin",
+    "-serial", "stdio",
+    "-vga", "std",
+]
+
+[tasks.run]
+run_task = { name = "qemu" }

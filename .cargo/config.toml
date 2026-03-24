@@ -1,0 +1,14 @@
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "x86_64-unknown-none"
+
+# Bootloader 0.9 + bootimage expect a static ELF. Recent rustc defaults to PIE for this target,
+# which maps vaddr 0 and triggers panics in bootloader/src/page_table.rs while mapping segments.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"
