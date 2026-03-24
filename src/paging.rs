@@ -10,8 +10,11 @@
 //! the offset-mapped address so it stays consistent when the heap and other regions live high.
 //!
 //! ## MMIO vs port I/O
-//! - **VGA text buffer** at physical `0xB8000` is memory-mapped. [`init`](init) idempotently
-//!   ensures a 4 KiB mapping at `phys_to_virt(0xB8000)`.
+//! - **VGA text buffer** at physical `0xB8000` is reached by [`crate::memory::phys_to_virt`]. The
+//!   bootloader’s **`map_physical_memory`** feature already maps all of RAM in that window (often
+//!   with **2 MiB huge pages**). **Never** call [`map_to_phys_4k`] for that VA: splitting those
+//!   huge pages to insert a 4 KiB mapping **corrupts** page tables and typically kills the display
+//!   (flash of text, then black).
 //! - **COM1** at I/O port `0x3F8` is **not** MMIO; [`crate::serial`](crate::serial) uses `in`/`out`.
 
 use spin::Mutex;
@@ -21,7 +24,7 @@ use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame,
     Size4KiB,
 };
-use x86_64::structures::paging::mapper::{MapToError, MapperFlush, UnmapError};
+use x86_64::structures::paging::mapper::{MapToError, MapperFlush, Translate, UnmapError};
 use x86_64::{PhysAddr, VirtAddr};
 
 /// Serialize all page-table edits: one `OffsetPageTable` at a time.
@@ -40,8 +43,12 @@ pub fn with_mapper<R>(f: impl FnOnce(&mut OffsetPageTable<'_>) -> R) -> R {
 
 /// Map virtual `virt` to physical `phys` as one 4 KiB page. Uses `alloc` for new page-table levels.
 ///
+/// **Avoid** using this for addresses inside the bootloader’s physical-memory window unless you
+/// understand huge-page splitting.
+///
 /// # Safety
 /// Caller must ensure the mapping cannot create unsound aliases or violate device requirements.
+#[allow(dead_code)]
 pub unsafe fn map_to_phys_4k<A: FrameAllocator<Size4KiB> + ?Sized>(
     mapper: &mut OffsetPageTable<'_>,
     alloc: &mut A,
@@ -82,27 +89,18 @@ pub fn unmap_4k_and_free_bitmap(
     Ok(())
 }
 
-fn ensure_vga_text_buffer_mapped(
-    mapper: &mut OffsetPageTable<'_>,
-    fa: &mut crate::memory::BitmapFrameAllocator,
-) {
-    let phys = PhysAddr::new(0xb8000);
-    let virt = VirtAddr::new(crate::memory::phys_to_virt(phys));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    match unsafe { map_to_phys_4k(mapper, fa, virt, phys, flags) } {
-        Ok(fl) => fl.flush(),
-        Err(MapToError::PageAlreadyMapped(_)) => {}
-        Err(e) => panic!("VGA 0xB8000 map failed: {:?}", e),
-    }
-}
-
-/// After [`crate::memory::init`](crate::memory::init), attach to CR3 and ensure MMIO coverage for VGA.
+/// After [`crate::memory::init`](crate::memory::init), sanity-check that the bootloader mapped the
+/// physical-memory window (including VGA). Does **not** edit page tables.
 pub fn init() {
     with_mapper(|mapper| {
-        let mut guard = crate::memory::lock_allocator();
-        let fa = guard
-            .as_mut()
-            .expect("memory::init must run before paging::init");
-        ensure_vga_text_buffer_mapped(mapper, fa);
+        let virt = VirtAddr::new(crate::memory::phys_to_virt(PhysAddr::new(0xb8000)));
+        let phys = mapper.translate_addr(virt).expect(
+            "VGA linear addr not mapped — enable bootloader `map_physical_memory` in Cargo.toml",
+        );
+        assert_eq!(
+            phys,
+            PhysAddr::new(0xb8000),
+            "unexpected VGA translation (expected identity phys for text buffer)"
+        );
     });
 }

@@ -101,7 +101,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         hlt();
     }
 
-    println!("Syscall ABI: write=1, exit=60 (Linux numbers). Entering ring 3…");
+    println!(
+        "Syscalls: read=0 (scancodes, non-blocking), write=1, mmap/brk stub ENOSYS, exit=60.",
+    );
+    println!("Ring 3 enters with IF=0 (no IRQ in user) — use user::enter_via_iret_irqs_on() to test timer.");
     syscall::init();
     user::map_and_load();
     println!(

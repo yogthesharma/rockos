@@ -1,6 +1,19 @@
 //! `syscall` / `sysret` ABI (Linux-compatible numbers for [`crate::user`] demos).
 //!
-//! **Implemented:** `write` (1), `exit` (60). `read` and the rest return `-ENOSYS` (`-38`).
+//! # Implemented
+//! - [`SYS_READ`] (**0**): non-blocking read of **raw PS/2 scancodes** from `fd == 0` into user memory.
+//! - [`SYS_WRITE`] (**1**): `fd` ignored; writes to serial.
+//! - [`SYS_EXIT`] (**60**): log and return `0` to ring 3.
+//!
+//! # Stubs (`-ENOSYS`)
+//! - [`SYS_MMAP`] (**9**), [`SYS_BRK`] (**12**): not yet (need virtual-memory policy + per-process state).
+//!
+//! # Roadmap (Unix-ish)
+//! - **`mmap` / `brk`**: anonymous mappings, optional kernel `VmArea` list, syscall return virt ranges.
+//! - **Per-process address space**: separate P4 or deep `fork`; switch `CR3` on reschedule.
+//! - **ELF loader / `exec`**: parse program headers, map RX/RW, user stack, `auxv`, jump to entry.
+//! - **Scheduler + `sleep`**: wait queues, `nanosleep`-style syscall, tie PIT or TSC to ticks.
+//! - **`wait` / `exit`**: parent collects status; zombie/reap; align with `SIGCHLD`-like semantics later.
 
 use core::arch::global_asm;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
@@ -61,21 +74,55 @@ unsafe extern "C" {
 
 const ENOSYS: u64 = (-38i64) as u64;
 
-/// Linux: `ssize_t write(int fd, const void *buf, size_t count);`
+/// Linux x86-64: `read(2)`
+pub const SYS_READ: u64 = 0;
+/// Linux: `write(2)`
 pub const SYS_WRITE: u64 = 1;
-/// Linux: `void exit(int status);` — returns to ring 3 **hlt** loop (see user program); rax holds 0.
+/// Linux: `mmap(2)` — stub
+pub const SYS_MMAP: u64 = 9;
+/// Linux: `brk(2)` — stub
+pub const SYS_BRK: u64 = 12;
+/// Linux: `exit(2)` / `exit_group`-style status in `rdi`.
 pub const SYS_EXIT: u64 = 60;
 
 #[no_mangle]
 extern "C" fn syscall_dispatch(n: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     match n {
+        SYS_READ => sys_read(arg0, arg1, arg2),
         SYS_WRITE => sys_write(arg0, arg1, arg2),
+        SYS_MMAP | SYS_BRK => ENOSYS,
         SYS_EXIT => {
             crate::println!("[syscall] exit({})", arg0 as i32);
             0
         }
         _ => ENOSYS,
     }
+}
+
+/// `read(0, buf, len)` — drains the **IRQ keyboard queue** (raw scancodes). Non-blocking: returns
+/// `0`..=`len`, never waits for a key. Other `fd` → `-EBADF` (-9).
+fn sys_read(fd: u64, buf_addr: u64, len: u64) -> u64 {
+    if fd != 0 {
+        return (-9i64) as u64;
+    }
+    if len > 4096 {
+        return (-22i64) as u64;
+    }
+    let len = len as usize;
+    if !crate::user::user_region_is_writable_range(buf_addr, len) {
+        return (-14i64) as u64;
+    }
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, len) };
+    let mut n = 0usize;
+    while n < len {
+        // `read_scancode`: IRQ queue first, then **port poll** — works even when user runs with `IF=0`.
+        let Some(b) = crate::keyboard::read_scancode() else {
+            break;
+        };
+        dst[n] = b;
+        n += 1;
+    }
+    n as u64
 }
 
 fn sys_write(_fd: u64, buf_addr: u64, len: u64) -> u64 {

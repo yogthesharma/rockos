@@ -23,7 +23,16 @@ panic = "abort"
 
 # Used by `bootimage runner` when you `cargo run` — keep in sync with Makefile.toml.
 [package.metadata.bootimage]
-run-args = ["-serial", "stdio", "-vga", "std"]
+# Keep in sync with Makefile.toml [tasks.qemu]. args
+# -no-reboot: triple fault exits QEMU instead of rebooting into a confusing loop.
+# -d …: log interrupts / guest errors / CPU reset to stderr (see why the guest resets).
+# More: run `qemu-system-x86_64 -trace help` and add e.g. `-trace events=…` for event traces.
+run-args = [
+    "-serial", "stdio",
+    "-vga", "std",
+    "-no-reboot",
+    "-d", "int,guest_errors,cpu_reset",
+]
 
 [package.metadata.cargo-make]
-run = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin -serial stdio -vga std"
+run = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-rockos.bin -serial stdio -vga std -no-reboot -d int,guest_errors,cpu_reset"
