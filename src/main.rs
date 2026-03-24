@@ -14,6 +14,7 @@ use core::panic::PanicInfo;
 use x86_64::instructions::hlt;
 
 mod elf;
+mod fs;
 mod gdt;
 mod heap;
 mod interrupts;
@@ -25,6 +26,7 @@ mod process;
 mod scheduler;
 mod serial;
 mod syscall;
+mod task;
 mod tty;
 mod user;
 mod vga;
